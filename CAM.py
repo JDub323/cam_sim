@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Dict, Literal, Optional, Sequence, Tuple
 
+import warnings
 import numpy as np
 
 
@@ -872,6 +873,9 @@ class QuantizedEuclideanCAM:
                 q_cam, queries, top_k=top_k, query_chunk_size=query_chunk_size
             )
 
+        if self.use_torch:
+            self._warn_about_numpy_fallback()
+
         votes = self._subarray_votes_batch_numpy(q_cam)
         exact_distances = self._all_cam_distances_batch(
             q_cam, query_chunk_size=query_chunk_size
@@ -1512,7 +1516,20 @@ class QuantizedEuclideanCAM:
         if self.use_torch and self._torch_can_use_fast_distances:
             return self._all_cam_distances_torch(q_cam)
 
+        if self.use_torch:
+            self._warn_about_numpy_fallback()
+
         return self._all_cam_distances_numpy(q_cam)
+
+    def _warn_about_numpy_fallback(self):
+        if self.use_torch:
+            warnings.warn(
+                "use_torch=True was requested, but the Torch fast distance path "
+                "is disabled; falling back to NumPy batch distances. Check "
+                "cam.info()['torch_fast_distances'] for details.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
 
     def _all_cam_distances_batch(
         self, q_cam: np.ndarray, *, query_chunk_size: Optional[int] = None
@@ -1527,6 +1544,9 @@ class QuantizedEuclideanCAM:
             return self._all_cam_distances_batch_torch(
                 q_cam, query_chunk_size=query_chunk_size
             )
+
+        if self.use_torch:
+            self._warn_about_numpy_fallback()
 
         return self._all_cam_distances_batch_numpy(
             q_cam, query_chunk_size=query_chunk_size

@@ -941,31 +941,51 @@ class QuantizedEuclideanCAM:
         result["indices"] and result["votes"] have shape
         [num_queries, top_k].
         """
-        q_cam = self.quantize_queries(queries)
+        skip_query_normalization = self._resolve_skip_query_normalization(
+            skip_query_normalization
+        )
+
+        q_cam = self.quantize_queries(
+            queries,
+            skip_query_normalization=skip_query_normalization,
+        )
+
         top_k = max(1, min(int(top_k), self.num_vectors))
 
         if self.use_torch and self._torch_can_use_fast_distances:
             return self._vote_search_batch_torch(
-                q_cam, queries, top_k=top_k, query_chunk_size=query_chunk_size
+                q_cam,
+                queries,
+                top_k=top_k,
+                query_chunk_size=query_chunk_size,
+                skip_query_normalization=skip_query_normalization,
             )
 
-        if self.use_torch:
-            self._warn_about_numpy_fallback()
-
         votes = self._subarray_votes_batch_numpy(q_cam)
+
         exact_distances = self._all_cam_distances_batch(
-            q_cam, query_chunk_size=query_chunk_size
+            q_cam,
+            query_chunk_size=query_chunk_size,
         )
-        ideal = self.ideal_scores_batch(queries)
+
+        ideal = (
+            np.full((q_cam.shape[0], self.num_vectors), np.nan, dtype=np.float32)
+            if skip_query_normalization
+            else self.ideal_scores_batch(queries)
+        )
 
         idx = np.empty((q_cam.shape[0], top_k), dtype=np.int64)
+
         for row in range(q_cam.shape[0]):
             order = np.lexsort((exact_distances[row], -votes[row]))
             idx[row] = order[:top_k]
 
         int_distances = np.take_along_axis(exact_distances, idx, axis=1)
+
         float_distances = self._cam_distances_to_float_distances(
-            int_distances, q_cam=q_cam, row_indices=idx
+            int_distances,
+            q_cam=q_cam,
+            row_indices=idx,
         )
 
         return {

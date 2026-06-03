@@ -5,6 +5,7 @@ from typing import Any, Dict, Literal, Optional, Sequence, Tuple
 
 import warnings
 import numpy as np
+import torch
 
 
 QuantRangeMode = Literal[

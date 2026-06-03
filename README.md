@@ -676,6 +676,12 @@ cam.vote_search_batch(queries, top_k=5, query_chunk_size=None)
 Subarray winner-takes-all voting search for many queries.
 
 ```python
+cam.weighted_vote_search_batch(queries, top_k=3, points=[3,2,1])
+
+```
+Give many points, winner is the one with the most
+
+```python
 cam.show_vote_internals(
     query,
     top_k=5,

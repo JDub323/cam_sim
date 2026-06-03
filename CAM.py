@@ -999,6 +999,254 @@ class QuantizedEuclideanCAM:
             "normalized_weights": self.normalized_weights[idx],
         }
 
+    def weighted_vote_search_batch(
+        self,
+        queries,
+        *,
+        top_k: int = 5,
+        local_top_k: Optional[int] = None,
+        points: Optional[Sequence[float]] = None,
+        query_chunk_size: Optional[int] = None,
+        skip_query_normalization: Optional[bool] = None,
+        distance_dtype=None,
+    ) -> Dict[str, np.ndarray]:
+        """
+        Torch batched weighted subarray voting search.
+
+        Each column subarray ranks its local nearest rows. Instead of giving
+        one vote only to the first-place winner, this gives rank-based points:
+
+            1st: 15
+            2nd: 12
+            3rd: 10
+            ...
+
+        Final ranking is:
+            1. larger total points is better
+            2. smaller full CAM distance breaks ties
+
+        This method keeps the expensive local-ranking and scoring work on the
+        Torch device. It returns NumPy arrays, like the rest of the public API.
+        """
+        if points is None:
+            points = [15, 12, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1]
+
+        points_np = np.asarray(points, dtype=np.float32)
+        if points_np.ndim != 1 or points_np.size == 0:
+            raise ValueError("points must be a nonempty 1D sequence")
+
+        if local_top_k is None:
+            local_top_k = int(points_np.size)
+        else:
+            local_top_k = int(local_top_k)
+
+        local_top_k = max(1, min(local_top_k, self.num_vectors))
+
+        if points_np.size < local_top_k:
+            points_np = np.pad(
+                points_np,
+                (0, local_top_k - points_np.size),
+                mode="constant",
+                constant_values=0,
+            )
+        else:
+            points_np = points_np[:local_top_k]
+
+        if not self.use_torch:
+            raise RuntimeError(
+                "weighted_vote_search_batch requires use_torch=True. "
+                "Construct the CAM with use_torch=True."
+            )
+
+        if torch is None:
+            raise RuntimeError("weighted_vote_search_batch requires PyTorch")
+
+        skip_query_normalization = self._resolve_skip_query_normalization(
+            skip_query_normalization
+        )
+
+        q_cam = self.quantize_queries(
+            queries,
+            skip_query_normalization=skip_query_normalization,
+        )
+
+        if q_cam.ndim != 2:
+            raise ValueError(f"queries must produce a 2D q_cam array, got {q_cam.shape}")
+
+        top_k = max(1, min(int(top_k), self.num_vectors))
+        num_queries = q_cam.shape[0]
+
+        device = getattr(self, "_torch_device", None)
+        if device is None:
+            device = torch.device(
+                getattr(self, "torch_device", None)
+                or ("cuda" if torch.cuda.is_available() else "cpu")
+            )
+
+        if distance_dtype is None:
+            distance_dtype = torch.float32
+
+        stored_np = self.cam_int_vectors if self.quantize_vectors else self.cam_vectors
+
+        stored_t = torch.as_tensor(
+            stored_np,
+            device=device,
+            dtype=distance_dtype,
+        )
+
+        points_t = torch.as_tensor(
+            points_np,
+            device=device,
+            dtype=torch.float32,
+        )
+
+        index_t = torch.arange(
+            self.num_vectors,
+            device=device,
+            dtype=torch.float64,
+        )
+
+        out_indices = []
+        out_points = []
+        out_int_distances = []
+        out_float_distances = []
+        out_similarities = []
+        out_ideal_scores = []
+
+        if query_chunk_size is None:
+            query_chunk_size = num_queries
+        else:
+            query_chunk_size = max(1, int(query_chunk_size))
+
+        for start in range(0, num_queries, query_chunk_size):
+            stop = min(start + query_chunk_size, num_queries)
+
+            q_chunk_np = q_cam[start:stop]
+            q_t = torch.as_tensor(
+                q_chunk_np,
+                device=device,
+                dtype=distance_dtype,
+            )
+
+            chunk_size = q_t.shape[0]
+
+            total_points = torch.zeros(
+                (chunk_size, self.num_vectors),
+                device=device,
+                dtype=torch.float32,
+            )
+
+            # Award rank-based points inside each column subarray.
+            for col_slice in self.cam_col_slices:
+                q_block = q_t[:, col_slice]
+                x_block = stored_t[:, col_slice]
+
+                q_norm_sq = torch.sum(q_block * q_block, dim=1)
+                x_norm_sq = torch.sum(x_block * x_block, dim=1)
+
+                local_distances = (
+                    q_norm_sq[:, None]
+                    + x_norm_sq[None, :]
+                    - 2.0 * torch.mm(q_block, x_block.T)
+                )
+                local_distances = torch.clamp(local_distances, min=0.0)
+
+                _, local_idx = torch.topk(
+                    local_distances,
+                    k=local_top_k,
+                    dim=1,
+                    largest=False,
+                    sorted=True,
+                )
+
+                total_points.scatter_add_(
+                    dim=1,
+                    index=local_idx,
+                    src=points_t[None, :].expand(chunk_size, local_top_k),
+                )
+
+            # Full CAM distance for tie-breaking.
+            q_norm_sq = torch.sum(q_t * q_t, dim=1)
+            x_norm_sq = torch.sum(stored_t * stored_t, dim=1)
+
+            exact_distances = (
+                q_norm_sq[:, None]
+                + x_norm_sq[None, :]
+                - 2.0 * torch.mm(q_t, stored_t.T)
+            )
+            exact_distances = torch.clamp(exact_distances, min=0.0)
+
+            # Composite score:
+            #   points dominate distance,
+            #   distance dominates tiny index tie-break.
+            #
+            # This avoids a full lexsort and keeps ranking on the GPU.
+            exact64 = exact_distances.to(torch.float64)
+            points64 = total_points.to(torch.float64)
+
+            dist_scale = torch.amax(exact64, dim=1, keepdim=True) + 1.0
+
+            score = points64 * dist_scale - exact64
+
+            # Tiny deterministic preference for lower row index when otherwise tied.
+            score = score - index_t[None, :] * 1e-12
+
+            _, idx_t = torch.topk(
+                score,
+                k=top_k,
+                dim=1,
+                largest=True,
+                sorted=True,
+            )
+
+            pts_t = torch.gather(total_points, 1, idx_t)
+            d_t = torch.gather(exact_distances, 1, idx_t)
+
+            idx_np = idx_t.detach().cpu().numpy().astype(np.int64)
+            pts_np = pts_t.detach().cpu().numpy().astype(np.float32)
+            d_np = d_t.detach().cpu().numpy()
+
+            if self.quantize_vectors:
+                d_np = np.rint(d_np).astype(np.int64)
+
+            float_d_np = self._cam_distances_to_float_distances(
+                d_np,
+                q_cam=q_chunk_np,
+                row_indices=idx_np,
+            )
+
+            out_indices.append(idx_np)
+            out_points.append(pts_np)
+            out_int_distances.append(d_np)
+            out_float_distances.append(float_d_np)
+            out_similarities.append((1.0 - 0.5 * float_d_np).astype(np.float32))
+
+            if skip_query_normalization:
+                ideal_np = np.full(idx_np.shape, np.nan, dtype=np.float32)
+            else:
+                ideal_full = self.ideal_scores_batch(queries[start:stop])
+                ideal_np = np.take_along_axis(ideal_full, idx_np, axis=1)
+
+            out_ideal_scores.append(ideal_np)
+
+        indices = np.concatenate(out_indices, axis=0)
+        total_points_out = np.concatenate(out_points, axis=0)
+        int_distances = np.concatenate(out_int_distances, axis=0)
+        float_distances = np.concatenate(out_float_distances, axis=0)
+        similarities = np.concatenate(out_similarities, axis=0)
+        ideal_scores = np.concatenate(out_ideal_scores, axis=0)
+
+        return {
+            "indices": indices,
+            "points": total_points_out,
+            "int_distances": int_distances,
+            "float_distances": float_distances,
+            "similarities": similarities,
+            "ideal_scores": ideal_scores,
+            "vectors": self.vectors[indices],
+            "normalized_weights": self.normalized_weights[indices],
+        }
+
     def quantize_query(
         self,
         query: Sequence[float],
